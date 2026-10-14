@@ -63,8 +63,11 @@ static int start_advertising(bool low_duty) {
 
     if (bt_addr_le_cmp(&central_addr, BT_ADDR_LE_NONE) != 0) {
         is_bonded = true;
-        struct bt_le_adv_param adv_param = low_duty ? *BT_LE_ADV_CONN_DIR_LOW_DUTY(&central_addr)
-                                                    : *BT_LE_ADV_CONN_DIR(&central_addr);
+        /* Always low duty. High-duty directed advertising is killed off by the
+         * spec after 1.28s, and the connected(BT_HCI_ERR_ADV_TIMEOUT) churn it
+         * produces buys nothing when we are simply waiting for our own central
+         * to come back. */
+        struct bt_le_adv_param adv_param = *BT_LE_ADV_CONN_DIR_LOW_DUTY(&central_addr);
         return bt_le_adv_start(&adv_param, NULL, 0, NULL, 0);
     } else {
         is_bonded = false;
@@ -75,24 +78,39 @@ static int start_advertising(bool low_duty) {
 static bool low_duty_advertising = false;
 static bool enabled = false;
 
+static void advertising_cb(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(advertising_work, advertising_cb);
+
 static void advertising_cb(struct k_work *work) {
+    if (!enabled || is_connected) {
+        return;
+    }
+
     const int err = start_advertising(low_duty_advertising);
-    if (err < 0) {
-        LOG_ERR("Failed to start advertising (%d)", err);
+    if (err < 0 && err != -EALREADY) {
+        /* Zephyr 3.5 has no recycled() callback, so this work item is the only
+         * thing that ever starts advertising. Without a retry a single failure
+         * -- most likely -ENOMEM, because the bt_conn from the connection we
+         * just lost has not been freed yet -- leaves the peripheral alive but
+         * permanently silent, recoverable only by cycling its power switch. */
+        LOG_ERR("Failed to start advertising (%d), retrying in 1s", err);
+        k_work_reschedule(&advertising_work, K_SECONDS(1));
     }
 }
 
-K_WORK_DEFINE(advertising_work, advertising_cb);
-
 static void connected(struct bt_conn *conn, uint8_t err) {
     is_connected = (err == 0);
+
+    if (is_connected) {
+        k_work_cancel_delayable(&advertising_work);
+    }
 
     raise_zmk_split_peripheral_status_changed(
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
 
     if (err == BT_HCI_ERR_ADV_TIMEOUT && enabled) {
         low_duty_advertising = true;
-        k_work_submit(&advertising_work);
+        k_work_reschedule(&advertising_work, K_MSEC(100));
     }
 }
 
@@ -110,7 +128,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
 
     if (enabled) {
         low_duty_advertising = false;
-        k_work_submit(&advertising_work);
+        /* Stands in for the recycled() callback newer Zephyr has: give the host
+         * a moment to free the bt_conn before asking for a connectable
+         * advertiser, and let the retry above cover us if it is still busy. */
+        k_work_reschedule(&advertising_work, K_MSEC(100));
     }
 }
 
@@ -171,9 +192,10 @@ static int split_peripheral_bt_set_enabled(bool en) {
 
     enabled = en;
     if (en) {
-        k_work_submit(&advertising_work);
+        k_work_reschedule(&advertising_work, K_NO_WAIT);
         return 0;
     } else {
+        k_work_cancel_delayable(&advertising_work);
         struct bt_conn *conn = NULL;
         bt_conn_foreach(BT_CONN_TYPE_LE, find_first_conn, &conn);
         if (conn) {
